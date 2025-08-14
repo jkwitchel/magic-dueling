@@ -9,7 +9,7 @@ Information-only dueling helper for Pathfinder 2e. Players select a skill and st
 
 ## Installation
 - Foundry Setup → Add-on Modules → Install Module → paste manifest URL:
-  `https://raw.githubusercontent.com/your-org/foundryvtt-magic-duel/main/module.json`
+  `https://raw.githubusercontent.com/jkwitchel/magic-dueling/main/module.json`
 - Or copy this folder into your Foundry `Data/modules` directory and restart Foundry.
 
 ## Usage
@@ -22,8 +22,8 @@ Information-only dueling helper for Pathfinder 2e. Players select a skill and st
 - For local dev, clone or symlink `magic-dueling` into your `Data/modules` directory.
 
 ## Links
-- Project: `https://github.com/your-org/foundryvtt-magic-duel`
-- Manifest: `https://raw.githubusercontent.com/your-org/foundryvtt-magic-duel/main/module.json`
+- Project: `https://github.com/jkwitchel/magic-dueling`
+- Manifest: `https://raw.githubusercontent.com/jkwitchel/magic-dueling/main/module.json`
 
 ## License
 MIT

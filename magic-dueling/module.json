@@ -1,0 +1,52 @@
+{
+  "id": "magic-dueling",
+  "title": "Magic Dueling (PF2e)",
+  "description": "Information-only dueling module for PF2e: players select a skill and stance (Cast/Trick/Shield), then roll with a consolidated ChatMessage.",
+  "version": "0.1.0",
+  "compatibility": {
+    "minimum": "13",
+    "verified": "13"
+  },
+  "authors": [
+    {
+      "name": "Magic Dueling",
+      "url": "https://example.com",
+      "email": "",
+      "flags": {}
+    }
+  ],
+  "esmodules": [
+    "scripts/main.js"
+  ],
+  "socket": true,
+  "styles": [
+    "styles/magic-dueling.css"
+  ],
+  "relationships": {
+    "systems": [
+      {
+        "id": "pf2e",
+        "type": "system",
+        "compatibility": {
+          "minimum": "5.0.0"
+        }
+      }
+    ],
+    "optional": [
+      {
+        "id": "socketlib",
+        "type": "module",
+        "compatibility": {
+          "minimum": "1.0.0"
+        }
+      }
+    ]
+  },
+  "url": "https://github.com/your-org/foundryvtt-magic-duel",
+  "manifest": "https://raw.githubusercontent.com/your-org/foundryvtt-magic-duel/main/module.json",
+  "download": "https://github.com/your-org/foundryvtt-magic-duel/releases/download/v0.1.0/module.zip",
+  "license": "MIT",
+  "readme": "README.md"
+}
+
+

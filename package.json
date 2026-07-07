@@ -1,0 +1,11 @@
+{
+  "name": "magic-dueling",
+  "version": "0.2.0",
+  "description": "Information-only PF2e dueling module for Foundry VTT v14.",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "test": "node --test"
+  },
+  "license": "MIT"
+}

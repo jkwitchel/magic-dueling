@@ -1,103 +1,240 @@
+import {
+  STANCES,
+  clampAnte,
+  isMagicSkill,
+  normalizeStance,
+  resolveDuel,
+  stanceLabel,
+} from "./logic.js";
+
 const MODULE_ID = "magic-dueling";
+const SOCKET_CHANNEL = `module.${MODULE_ID}`;
+const HUD_BUTTON_CLASS = "magic-duel-hud-btn";
 
-const STANCES = {
-  cast: { id: "cast", label: "Cast", tooltip: "Offense—beats Trick, loses to Shield" },
-  trick: { id: "trick", label: "Trick", tooltip: "Feint—beats Shield, loses to Cast" },
-  shield: { id: "shield", label: "Shield", tooltip: "Guard—beats Cast, loses to Trick" },
-};
-
-// PF2e core magic skills to visually highlight in UI and chat
-const MAGIC_SKILL_LABELS = new Set(["arcana", "nature", "occultism", "religion"]);
+/* -------------------------------------------- */
+/*  Foundry helpers                             */
+/* -------------------------------------------- */
 
 function getSetting(key) {
   return game.settings.get(MODULE_ID, key);
 }
 
 function generateId() {
-  return foundry?.utils?.randomID?.() ?? (Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2));
-}
-
-function rpsOutcome(a, b) {
-  if (a === b) return 0; // tie
-  if (
-    (a === "cast" && b === "trick") ||
-    (a === "trick" && b === "shield") ||
-    (a === "shield" && b === "cast")
-  )
-    return 1; // a wins
-  return -1; // b wins
+  return (
+    foundry?.utils?.randomID?.() ??
+    Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2)
+  );
 }
 
 function isPf2eActor(actor) {
-  return actor?.system?.schema?.id?.startsWith?.("pf2e") || game.system?.id === "pf2e" && actor?.system;
+  return (
+    actor?.system?.schema?.id?.startsWith?.("pf2e") ||
+    (game.system?.id === "pf2e" && !!actor?.system)
+  );
 }
 
+/**
+ * Build the private skill list for an actor, tagging PF2e magic skills.
+ * Foundry-specific: reads the PF2e Statistic map or the raw system data.
+ */
 function getActorSkillChoices(actor) {
-  // Prefer PF2e's Statistic map if present (actor.skills), else fall back to actor.system.skills
   const choices = [];
   const statMap = actor?.skills ?? actor?.system?.skills ?? {};
   for (const [key, data] of Object.entries(statMap)) {
-    const label = data?.label ?? data?.name ?? key.toUpperCase();
+    const label = data?.label ?? data?.name ?? String(key).toUpperCase();
     const modifier = Number(
-      data?.totalModifier ?? data?.mod ?? data?.modifier ?? data?.value ?? 0
+      data?.totalModifier ?? data?.mod ?? data?.modifier ?? data?.value ?? 0,
     );
-    if (Number.isFinite(modifier)) {
-      const k = String(key).toLowerCase();
-      const l = String(label).toLowerCase();
-      const isMagic = MAGIC_SKILL_LABELS.has(l) || MAGIC_SKILL_LABELS.has(k);
-      choices.push({ key, label, modifier, isMagic });
-    }
+    if (!Number.isFinite(modifier)) continue;
+    choices.push({ key, label, modifier, isMagic: isMagicSkill({ key, label }) });
   }
-  // sort by localized label
   choices.sort((a, b) => a.label.localeCompare(b.label));
   return choices;
 }
 
-// Ante is informational only; no character resource interaction required.
+/* -------------------------------------------- */
+/*  DialogV2 helper                             */
+/* -------------------------------------------- */
 
-function socketSend(targetUserId, event, payload) {
-  // Prefer socketlib if present, but guard failures and fall back gracefully
+/**
+ * Render a DialogV2 with a deterministic timeout. Closing/cancelling/timeout
+ * all resolve with `undefined` so callers can treat them as decline/cancel.
+ *
+ * @param {object} opts
+ * @param {string} opts.title
+ * @param {string} opts.content
+ * @param {number} [opts.width]
+ * @param {number} [opts.timeoutMs]
+ * @param {boolean} [opts.modal]
+ * @param {Array<{action: string, label: string, default?: boolean,
+ *   value?: any, resolve?: Function}>} opts.buttons
+ * @returns {Promise<any>} the selected button's value, or undefined
+ */
+async function runDialog({ title, content, width = 360, timeoutMs, modal = false, buttons }) {
+  const DialogV2 = foundry.applications.api.DialogV2;
+  return new Promise((resolve) => {
+    let settled = false;
+    let timer = null;
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      resolve(value);
+    };
+
+    const dlg = new DialogV2({
+      window: { title },
+      position: { width, height: "auto" },
+      modal,
+      content,
+      buttons: buttons.map((b) => ({
+        action: b.action,
+        label: b.label,
+        default: b.default ?? false,
+        callback: async (event, button, dialog) => {
+          try {
+            const value = b.resolve ? await b.resolve(event, button, dialog) : b.value;
+            finish(value);
+            return value;
+          } catch (err) {
+            console.error(MODULE_ID, "dialog button error", err);
+            finish(undefined);
+            return undefined;
+          }
+        },
+      })),
+    });
+
+    // Any close (window control, Escape, post-button auto-close, timeout)
+    // funnels through here. `finish` ignores calls after the first.
+    const origClose = dlg.close.bind(dlg);
+    dlg.close = async (options) => {
+      const result = await origClose(options);
+      finish(undefined);
+      return result;
+    };
+
+    dlg.render({ force: true });
+
+    if (Number.isFinite(timeoutMs) && timeoutMs > 0) {
+      timer = setTimeout(() => {
+        finish(undefined);
+        try {
+          dlg.close();
+        } catch {
+          /* ignore */
+        }
+      }, timeoutMs);
+    }
+  });
+}
+
+/* -------------------------------------------- */
+/*  Socket transport (socketlib + native)       */
+/* -------------------------------------------- */
+
+function getSocketlib() {
   try {
     if (game.modules.get("socketlib")?.active && globalThis.socketlib) {
-      const socket = globalThis.socketlib.registerModule(MODULE_ID);
-      if (socket?.executeAsUser) return socket.executeAsUser(event, targetUserId, payload);
+      return globalThis.socketlib.registerModule(MODULE_ID);
     }
   } catch (e) {
-    console.warn(MODULE_ID, "socketlib send failed, using fallback", e);
+    console.warn(MODULE_ID, "socketlib unavailable", e);
   }
-  // Fallback: use Foundry's game.socket for our module channel
+  return null;
+}
+
+/**
+ * Send a request to a specific user and await their response.
+ * Prefers socketlib; falls back to the native module socket channel.
+ */
+async function socketRequest(targetUserId, event, payload, { timeoutMs } = {}) {
+  if (typeof targetUserId !== "string" || !targetUserId) {
+    console.warn(MODULE_ID, "socketRequest called without a valid targetUserId");
+    return undefined;
+  }
+
+  const socket = getSocketlib();
+  if (socket?.executeAsUser) {
+    try {
+      return await socket.executeAsUser(event, targetUserId, payload);
+    } catch (e) {
+      console.warn(MODULE_ID, "socketlib request failed, using native fallback", e);
+    }
+  }
+
+  return nativeSocketRequest(targetUserId, event, payload, { timeoutMs });
+}
+
+function nativeSocketRequest(targetUserId, event, payload, { timeoutMs } = {}) {
   return new Promise((resolve) => {
     const requestId = generateId();
-    const handler = (data) => {
-      if (data?.requestId !== requestId) return;
-      game.socket.off(`module.${MODULE_ID}`, handler);
-      resolve(data?.response);
+    let settled = false;
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      game.socket.off(SOCKET_CHANNEL, handler);
+      resolve(value);
     };
-    game.socket.on(`module.${MODULE_ID}`, handler);
-    game.socket.emit(`module.${MODULE_ID}`, { type: event, payload, requestId, targetUserId });
-    // If no response mechanism, resolve undefined after timeout to avoid leaks
-    setTimeout(() => {
-      game.socket.off(`module.${MODULE_ID}`, handler);
-      resolve(undefined);
-    }, 65_000);
+    const handler = (data) => {
+      if (!data || data.kind !== "response" || data.requestId !== requestId) return;
+      finish(data.response);
+    };
+    game.socket.on(SOCKET_CHANNEL, handler);
+    game.socket.emit(SOCKET_CHANNEL, {
+      kind: "request",
+      type: event,
+      payload,
+      requestId,
+      targetUserId,
+      senderUserId: game.user.id,
+    });
+    // Deterministic ceiling; the remote prompt resolves well before this.
+    const wait = Math.max(5_000, Number(timeoutMs) || 60_000) + 10_000;
+    setTimeout(() => finish(undefined), wait);
   });
 }
 
-function registerSocketFallbackHandler() {
-  game.socket.on(`module.${MODULE_ID}`, async (data) => {
-    if (!data || (data.targetUserId && data.targetUserId !== game.user.id)) return;
-    if (data.type === "prompt-accept") {
-      const response = await DuelManager.promptAccept(data.payload);
-      game.socket.emit(`module.${MODULE_ID}`, { requestId: data.requestId, response });
-    } else if (data.type === "prompt-setup") {
-      const response = await DuelManager.promptSetup(data.payload);
-      game.socket.emit(`module.${MODULE_ID}`, { requestId: data.requestId, response });
-    } else if (data.type === "opponent-ready") {
-      DuelManager.receiveOpponentReady(data.payload);
-      game.socket.emit(`module.${MODULE_ID}`, { requestId: data.requestId, response: true });
+function registerNativeSocketHandler() {
+  game.socket.on(SOCKET_CHANNEL, async (data) => {
+    if (!data || data.kind !== "request") return;
+    // Only the intended recipient handles a request; avoids duplicate prompts
+    // when every connected client receives the broadcast.
+    if (data.targetUserId !== game.user.id) return;
+    if (typeof data.requestId !== "string" || typeof data.type !== "string") return;
+
+    let response;
+    try {
+      response = await handleRemoteRequest(data.type, data.payload);
+    } catch (err) {
+      console.error(MODULE_ID, "remote request handler failed", err);
+      response = undefined;
     }
+    game.socket.emit(SOCKET_CHANNEL, {
+      kind: "response",
+      requestId: data.requestId,
+      response,
+    });
   });
 }
+
+async function handleRemoteRequest(type, payload) {
+  switch (type) {
+    case "prompt-accept":
+      return DuelManager.promptAccept(payload);
+    case "prompt-setup":
+      return DuelManager.promptSetup(payload);
+    case "opponent-ready":
+      return DuelManager.receiveOpponentReady(payload);
+    default:
+      console.warn(MODULE_ID, "unknown socket request type", type);
+      return undefined;
+  }
+}
+
+/* -------------------------------------------- */
+/*  Duel manager                                */
+/* -------------------------------------------- */
 
 class DuelManager {
   static init() {
@@ -128,40 +265,70 @@ class DuelManager {
       range: { min: 10, max: 600, step: 10 },
     });
 
-    // HUD control
-    Hooks.on("renderTokenHUD", (hud, html) => {
-      try {
-        const controlled = canvas.tokens.controlled;
-        if (controlled.length !== 1) return;
-        const token = controlled[0];
-        if (!token?.actor?.isOwner || !isPf2eActor(token.actor)) return;
-        const btn = $(`<div class="control-icon magic-duel" title="Magic Duel"><i class="fas fa-hat-wizard"></i></div>`);
-        btn.on("click", () => DuelManager.initiateFromSelection());
-        html.find(".col.left .control-buttons").append(btn);
-      } catch (err) {
-        console.error(MODULE_ID, "HUD button error", err);
-      }
-    });
+    Hooks.on("renderTokenHUD", DuelManager.onRenderTokenHUD);
 
-    // Register socketlib handlers (if available)
-    try {
-      if (game.modules.get("socketlib")?.active && globalThis.socketlib) {
-        const socket = globalThis.socketlib.registerModule(MODULE_ID);
+    // Register socketlib request handlers when available.
+    const socket = getSocketlib();
+    if (socket) {
+      try {
         socket.register("prompt-accept", DuelManager.promptAccept);
         socket.register("prompt-setup", DuelManager.promptSetup);
         socket.register("opponent-ready", DuelManager.receiveOpponentReady);
+      } catch (e) {
+        console.error(MODULE_ID, "socketlib registration failed", e);
       }
-    } catch (e) {
-      console.error(MODULE_ID, "socketlib registration failed", e);
     }
 
-    // API for macros
-    game.modules.get(MODULE_ID).api = {
-      initiate: DuelManager.initiateFromSelection,
-    };
+    registerNativeSocketHandler();
 
-    registerSocketFallbackHandler();
+    DuelManager.exposeApi();
   }
+
+  static exposeApi() {
+    const api = { initiate: DuelManager.initiateFromSelection };
+    const mod = game.modules.get(MODULE_ID);
+    if (mod) mod.api = api;
+    // Intentional convenience global for macros.
+    globalThis.MagicDueling = api;
+  }
+
+  /* -------------------- HUD -------------------- */
+
+  static onRenderTokenHUD(hud, html) {
+    try {
+      const root = html instanceof HTMLElement ? html : html?.[0];
+      if (!root) return;
+
+      const controlled = canvas.tokens.controlled;
+      if (controlled.length !== 1) return;
+      const token = controlled[0];
+      if (!token?.actor?.isOwner || !isPf2eActor(token.actor)) return;
+
+      // Avoid duplicates on repeated HUD renders.
+      if (root.querySelector(`.${HUD_BUTTON_CLASS}`)) return;
+
+      const sample = root.querySelector(".control-icon");
+      const tag = sample?.tagName?.toLowerCase() === "button" ? "button" : "div";
+      const btn = document.createElement(tag);
+      if (tag === "button") btn.type = "button";
+      btn.className = `control-icon ${HUD_BUTTON_CLASS}`;
+      btn.dataset.tooltip = "Magic Duel";
+      btn.setAttribute("aria-label", "Magic Duel");
+      btn.innerHTML = `<i class="fas fa-hat-wizard"></i>`;
+      btn.addEventListener("click", (event) => {
+        event.preventDefault();
+        DuelManager.initiateFromSelection();
+      });
+
+      const col = root.querySelector(".col.left") ?? root.querySelector(".col.right") ?? root;
+      const container = col.querySelector(".control-buttons") ?? col;
+      container.appendChild(btn);
+    } catch (err) {
+      console.error(MODULE_ID, "HUD button error", err);
+    }
+  }
+
+  /* ----------------- Initiation ---------------- */
 
   static async initiateFromSelection() {
     try {
@@ -171,7 +338,7 @@ class DuelManager {
         return;
       }
 
-      // If one token is selected, but they have exactly one targeted PF2e token, use that as the target automatically
+      // One selected token + exactly one valid target → use the target.
       if (selection.length === 1) {
         const challengerCandidate = selection[0];
         const targeted = Array.from(game.user.targets ?? []);
@@ -179,40 +346,41 @@ class DuelManager {
           .filter((t) => t?.id !== challengerCandidate?.id)
           .filter((t) => t?.actor && isPf2eActor(t.actor));
         if (validTargets.length === 1) {
-          const t = validTargets[0];
-          return await DuelManager._startWithTokens({ challengerToken: challengerCandidate, targetToken: t });
+          return await DuelManager._startWithTokens({
+            challengerToken: challengerCandidate,
+            targetToken: validTargets[0],
+          });
         }
       }
 
-      let challengerToken; let targetToken;
+      let challengerToken;
+      let targetToken;
+
       if (selection.length === 2) {
         const owned = selection.filter((t) => t.actor?.isOwner);
         if (owned.length === 1) {
           challengerToken = owned[0];
           targetToken = selection.find((t) => t !== challengerToken);
         } else {
-          // Ambiguous: prompt for who is the challenger
-          const a = selection[0];
-          const b = selection[1];
-          const choice = await new Promise((resolve) => {
-            new Dialog({
-              title: "Select Challenger",
-              content: `<p>Choose who is the challenger:</p>
-                <div class="md-row">
-                  <img src="${a.document.texture.src}" width="36" height="36"/>
-                  <strong>${a.name}</strong>
-                  <span>vs</span>
-                  <img src="${b.document.texture.src}" width="36" height="36"/>
-                  <strong>${b.name}</strong>
-                </div>`,
-              buttons: {
-                a: { label: `${a.name} challenges`, callback: () => resolve("a") },
-                b: { label: `${b.name} challenges`, callback: () => resolve("b") },
-                cancel: { label: "Cancel", callback: () => resolve(null) },
-              },
-              default: "a",
-              close: () => resolve(null),
-            }).render(true);
+          const [a, b] = selection;
+          const choice = await runDialog({
+            title: "Select Challenger",
+            width: 360,
+            content: `<div class="magic-dueling-dialog">
+              <p>Choose who is the challenger:</p>
+              <div class="magic-dueling-row">
+                <img src="${a.document.texture.src}" width="36" height="36" alt=""/>
+                <strong>${a.name}</strong>
+                <span>vs</span>
+                <img src="${b.document.texture.src}" width="36" height="36" alt=""/>
+                <strong>${b.name}</strong>
+              </div>
+            </div>`,
+            buttons: [
+              { action: "a", label: `${a.name} challenges`, default: true, value: "a" },
+              { action: "b", label: `${b.name} challenges`, value: "b" },
+              { action: "cancel", label: "Cancel", value: undefined },
+            ],
           });
           if (!choice) return;
           challengerToken = choice === "a" ? a : b;
@@ -220,27 +388,39 @@ class DuelManager {
         }
       } else {
         challengerToken = selection[0];
-        // Prompt for target among player-owned tokens on scene
-        const playerOwned = canvas.tokens.placeables.filter((t) => t !== challengerToken && t.actor && t.actor.hasPlayerOwner && isPf2eActor(t.actor));
+        const playerOwned = canvas.tokens.placeables.filter(
+          (t) =>
+            t !== challengerToken &&
+            t.actor &&
+            t.actor.hasPlayerOwner &&
+            isPf2eActor(t.actor),
+        );
         if (!playerOwned.length) {
           ui.notifications.warn("No valid target tokens owned by players in the scene.");
           return;
         }
-        const choices = Object.fromEntries(playerOwned.map((t) => [t.id, `${t.name} (${t.actor.name})`]));
-        const picked = await new Promise((resolve) => {
-          new Dialog({
-            title: "Select Duel Target",
-            content: `<p>Select a target token:</p>
-              <div class="form-group"><label>Target</label>
-              <select name="target">${Object.entries(choices).map(([id, label]) => `<option value="${id}">${label}</option>`).join("")}</select>
-              </div>`,
-            buttons: {
-              ok: { label: "OK", callback: (html) => resolve(html.find("select[name=target]").val()) },
-              cancel: { label: "Cancel", callback: () => resolve(null) },
+        const options = playerOwned
+          .map((t) => `<option value="${t.id}">${t.name} (${t.actor.name})</option>`)
+          .join("");
+        const picked = await runDialog({
+          title: "Select Duel Target",
+          width: 360,
+          content: `<form class="magic-dueling-dialog">
+            <div class="form-group">
+              <label>Target</label>
+              <select name="target">${options}</select>
+            </div>
+          </form>`,
+          buttons: [
+            {
+              action: "ok",
+              label: "OK",
+              default: true,
+              resolve: (event, button, dialog) =>
+                dialog.element.querySelector("select[name=target]")?.value,
             },
-            default: "ok",
-            close: () => resolve(null),
-          }).render(true);
+            { action: "cancel", label: "Cancel", value: undefined },
+          ],
         });
         if (!picked) return;
         targetToken = playerOwned.find((t) => t.id === picked);
@@ -257,7 +437,6 @@ class DuelManager {
 
   static async _startWithTokens({ challengerToken, targetToken }) {
     try {
-      // Permission check
       const allowAny = getSetting("allowAnyPlayerToInitiate");
       if (!challengerToken.actor?.isOwner) {
         ui.notifications.error("You must own the challenger's actor to initiate a duel.");
@@ -268,42 +447,66 @@ class DuelManager {
         return;
       }
 
-      // Consent on target's client
       const acceptTimeout = getSetting("acceptTimeoutSec") * 1000;
-      const targetUserId = DuelManager._owningUserId(targetToken.actor, { requireActive: true, allowGM: true });
+      const targetUserId = DuelManager._owningUserId(targetToken.actor, {
+        requireActive: true,
+        allowGM: true,
+      });
       if (!targetUserId) {
-        ui.notifications.warn("No eligible user is available to accept the duel (no owner or GM online).");
+        ui.notifications.warn(
+          "No eligible user is available to accept the duel (no owner or GM online).",
+        );
         return;
       }
+
       const consentPayload = {
-        challengerUserId: DuelManager._owningUserId(challengerToken.actor, { requireActive: false, allowGM: true }) ?? game.user.id,
-        targetUserId,
         challenger: DuelManager._tokenLite(challengerToken),
         target: DuelManager._tokenLite(targetToken),
         timeoutMs: acceptTimeout,
       };
 
-      const accepted = await DuelManager._promptAcceptTarget(targetUserId, consentPayload);
+      const accepted = await socketRequest(targetUserId, "prompt-accept", consentPayload, {
+        timeoutMs: acceptTimeout,
+      });
       if (!accepted) {
-        ChatMessage.create({ content: `<p><strong>Magic Duel</strong>: ${targetToken.name} declined or did not respond.</p>` });
+        await ChatMessage.create({
+          content: `<div class="magic-dueling-chat"><p><strong>Magic Duel:</strong> ${targetToken.name} declined or did not respond.</p></div>`,
+        });
         return;
       }
 
-      // Setup per client
       const setupTimeout = getSetting("setupTimeoutSec") * 1000;
       const duelId = generateId();
 
       const [challengerSetup, targetSetup] = await Promise.all([
-        DuelManager.promptSetup({ duelId, who: "challenger", token: DuelManager._tokenLite(challengerToken), timeoutMs: setupTimeout, opponentUserId: targetUserId }),
-        DuelManager._promptSetupTarget(targetUserId, { duelId, who: "target", token: DuelManager._tokenLite(targetToken), timeoutMs: setupTimeout, opponentUserId: game.user.id }),
+        DuelManager.promptSetup({
+          duelId,
+          who: "challenger",
+          token: DuelManager._tokenLite(challengerToken),
+          timeoutMs: setupTimeout,
+          opponentUserId: targetUserId,
+        }),
+        socketRequest(
+          targetUserId,
+          "prompt-setup",
+          {
+            duelId,
+            who: "target",
+            token: DuelManager._tokenLite(targetToken),
+            timeoutMs: setupTimeout,
+            opponentUserId: game.user.id,
+          },
+          { timeoutMs: setupTimeout },
+        ),
       ]);
 
       if (!challengerSetup || !targetSetup) {
-        ChatMessage.create({ content: `<p><strong>Magic Duel</strong>: Duel cancelled during setup.</p>` });
+        await ChatMessage.create({
+          content: `<div class="magic-dueling-chat"><p><strong>Magic Duel:</strong> Duel cancelled during setup.</p></div>`,
+        });
         return;
       }
 
-      // Resolve
       await DuelManager.resolveAndAnnounce({
         challenger: { token: DuelManager._tokenLite(challengerToken), ...challengerSetup },
         target: { token: DuelManager._tokenLite(targetToken), ...targetSetup },
@@ -337,184 +540,213 @@ class DuelManager {
     return null;
   }
 
-  static async _promptAcceptTarget(targetUserId, payload) {
-    // Prefer socketlib to run a prompt on target client
-    if (game.modules.get("socketlib")?.active && globalThis.socketlib) {
-      try {
-        const socket = globalThis.socketlib.registerModule(MODULE_ID);
-        if (socket?.executeAsUser) return await socket.executeAsUser("prompt-accept", targetUserId, payload);
-      } catch (e) {
-        console.error(MODULE_ID, "socketlib accept failed, falling back", e);
-      }
-    }
-    // Fallback own socket
-    return socketSend(targetUserId, "prompt-accept", payload);
-  }
+  /* -------------------- Prompts (run on recipient client) ------------- */
 
-  static async _promptSetupTarget(targetUserId, payload) {
-    if (game.modules.get("socketlib")?.active && globalThis.socketlib) {
-      try {
-        const socket = globalThis.socketlib.registerModule(MODULE_ID);
-        if (socket?.executeAsUser) return await socket.executeAsUser("prompt-setup", targetUserId, payload);
-      } catch (e) {
-        console.error(MODULE_ID, "socketlib setup failed, falling back", e);
-      }
+  static async promptAccept(payload) {
+    const { challenger, target, timeoutMs } = payload ?? {};
+    if (!challenger?.name || !target?.name) {
+      console.warn(MODULE_ID, "promptAccept received an incomplete payload", payload);
+      return false;
     }
-    return socketSend(targetUserId, "prompt-setup", payload);
-  }
-
-  static async promptAccept({ challenger, target, timeoutMs }) {
-    return new Promise((resolve) => {
-      const dlg = new Dialog({
-        title: "Magic Duel Challenge",
-        content: `<div class="md-challenge">
-          <p>${challenger.name} challenges ${target.name} to a Magic Duel.</p>
-          <div class="md-row">
-            <img src="${challenger.img}" width="48" height="48"/>
-            <span>${challenger.name}</span>
-            <span>vs</span>
-            <img src="${target.img}" width="48" height="48"/>
-            <span>${target.name}</span>
-          </div>
-        </div>`,
-        buttons: {
-          accept: { label: "Accept", callback: () => resolve(true) },
-          decline: { label: "Decline", callback: () => resolve(false) },
-        },
-        default: "accept",
-        close: () => resolve(false),
-      }).render(true);
-      setTimeout(() => {
-        try { dlg.close({ force: true }); } catch {}
-        resolve(false);
-      }, Math.max(5_000, timeoutMs ?? 30_000));
+    const result = await runDialog({
+      title: "Magic Duel Challenge",
+      width: 360,
+      timeoutMs: Math.max(5_000, Number(timeoutMs) || 30_000),
+      content: `<div class="magic-dueling-dialog">
+        <p>${challenger.name} challenges ${target.name} to a Magic Duel.</p>
+        <div class="magic-dueling-row">
+          <img src="${challenger.img}" width="48" height="48" alt=""/>
+          <span>${challenger.name}</span>
+          <span>vs</span>
+          <img src="${target.img}" width="48" height="48" alt=""/>
+          <span>${target.name}</span>
+        </div>
+      </div>`,
+      buttons: [
+        { action: "accept", label: "Accept", default: true, value: true },
+        { action: "decline", label: "Decline", value: false },
+      ],
     });
+    return result === true;
   }
 
-  static async promptSetup({ duelId, who, token, timeoutMs, opponentUserId }) {
+  static async promptSetup(payload) {
+    const { duelId, who, token, timeoutMs, opponentUserId } = payload ?? {};
+    if (!token?.actorId) {
+      console.warn(MODULE_ID, "promptSetup received an incomplete payload", payload);
+      return null;
+    }
     const actor = game.actors.get(token.actorId);
     const skills = getActorSkillChoices(actor);
-    if (!skills.length) return null;
+    if (!skills.length) {
+      console.warn(MODULE_ID, "promptSetup found no skills for actor", token.actorId);
+      return null;
+    }
+
     const anteOptions = [
       { value: "0", label: "0 (Cantrip)" },
-      ...Array.from({ length: 10 }, (_, i) => i + 1).map((lvl) => ({ value: String(lvl), label: String(lvl) })),
+      ...Array.from({ length: 10 }, (_, i) => ({ value: String(i + 1), label: String(i + 1) })),
     ];
-    const content = `<form class="md-setup">
+
+    const content = `<form class="magic-dueling-dialog magic-dueling-setup">
       <p>Select your skill and stance. This is private to you.</p>
       <div class="form-group">
         <label>Skill</label>
-        <select name="skill">${skills.map((s) => {
-          const star = s.isMagic ? "⭐ " : "";
-          return `<option value="${s.key}" data-mod="${s.modifier}" data-magic="${s.isMagic ? "1" : "0"}">${star}${s.label} (${s.modifier >= 0 ? "+" : ""}${s.modifier})</option>`;
-        }).join("")}</select>
+        <select name="skill">${skills
+          .map((s) => {
+            const star = s.isMagic ? "&#11088; " : "";
+            const sign = s.modifier >= 0 ? "+" : "";
+            const cls = s.isMagic ? ' class="magic-dueling-magic"' : "";
+            return `<option value="${s.key}"${cls}>${star}${s.label} (${sign}${s.modifier})</option>`;
+          })
+          .join("")}</select>
       </div>
-      <fieldset class="md-stances">
+      <fieldset class="magic-dueling-stances">
         <legend>Stance</legend>
-        ${Object.values(STANCES).map((st) => `<label class="radio">
+        ${Object.values(STANCES)
+          .map(
+            (st) => `<label class="magic-dueling-stance">
           <input type="radio" name="stance" value="${st.id}" ${st.id === "cast" ? "checked" : ""}>
           <span title="${st.tooltip}">${st.label}</span>
-        </label>`).join("")}
+        </label>`,
+          )
+          .join("")}
       </fieldset>
       <div class="form-group">
         <label>Ante Spell Slot</label>
-        <select name="ante">${anteOptions.map((o) => `<option value="${o.value}">${o.label}</option>`).join("")}</select>
+        <select name="ante">${anteOptions
+          .map((o) => `<option value="${o.value}">${o.label}</option>`)
+          .join("")}</select>
       </div>
     </form>`;
-    return new Promise((resolve) => {
-      let resolved = false;
-      const dlg = new Dialog({
-        title: `Magic Duel Setup — ${who === "challenger" ? "Challenger" : "Target"}`,
-        content,
-        buttons: {
-          ready: {
-            label: "Ready",
-            callback: (html) => {
-              const skillKey = html.find("select[name=skill]").val();
-              const stance = html.find("input[name=stance]:checked").val();
-              const chosen = skills.find((s) => s.key === skillKey);
-              const anteLevel = Math.max(0, Number(html.find("select[name=ante]").val() ?? 0));
-              ui.notifications.info("Ready — waiting for opponent...");
-              if (opponentUserId) DuelManager.notifyOpponentReady({ duelId, name: token.name, opponentUserId });
-              resolved = true;
-              resolve({ duelId, who, skillKey, skillLabel: chosen?.label ?? skillKey, modifier: chosen?.modifier ?? 0, stance, skillIsMagic: !!chosen?.isMagic, anteLevel });
-            },
+
+    const result = await runDialog({
+      title: `Magic Duel Setup — ${who === "challenger" ? "Challenger" : "Target"}`,
+      width: 360,
+      timeoutMs: Math.max(10_000, Number(timeoutMs) || 60_000),
+      content,
+      buttons: [
+        {
+          action: "ready",
+          label: "Ready",
+          default: true,
+          resolve: (event, button, dialog) => {
+            const form = dialog.element.querySelector("form");
+            const skillKey = form?.elements?.skill?.value;
+            const stance = normalizeStance(form?.elements?.stance?.value) ?? "cast";
+            const anteLevel = clampAnte(form?.elements?.ante?.value);
+            const chosen = skills.find((s) => s.key === skillKey);
+            ui.notifications.info("Ready — waiting for opponent...");
+            if (opponentUserId) {
+              DuelManager.notifyOpponentReady({ duelId, name: token.name, opponentUserId });
+            }
+            return {
+              duelId,
+              who,
+              skillKey,
+              skillLabel: chosen?.label ?? skillKey,
+              modifier: chosen?.modifier ?? 0,
+              stance,
+              skillIsMagic: !!chosen?.isMagic,
+              anteLevel,
+            };
           },
-          cancel: { label: "Cancel", callback: () => resolve(null) },
         },
-        default: "ready",
-        close: () => { if (!resolved) resolve(null); },
-      }).render(true);
-      setTimeout(() => { try { dlg.close({ force: true }); } catch {} if (!resolved) resolve(null); }, Math.max(10_000, timeoutMs ?? 60_000));
+        { action: "cancel", label: "Cancel", value: null },
+      ],
     });
+
+    return result ?? null;
   }
 
   static async notifyOpponentReady({ duelId, name, opponentUserId }) {
-    // socketlib preferred
+    if (!opponentUserId) return;
     try {
-      if (game.modules.get("socketlib")?.active && globalThis.socketlib) {
-        const socket = globalThis.socketlib.registerModule(MODULE_ID);
-        if (socket?.executeAsUser) {
-          await socket.executeAsUser("opponent-ready", opponentUserId, { duelId, name });
-          return;
-        }
-      }
-    } catch {}
-    // fallback
-    await socketSend(opponentUserId, "opponent-ready", { duelId, name });
+      await socketRequest(opponentUserId, "opponent-ready", { duelId, name });
+    } catch (e) {
+      console.warn(MODULE_ID, "notifyOpponentReady failed", e);
+    }
   }
 
-  static receiveOpponentReady({ name }) {
-    ui.notifications.info(`${name} is ready.`);
+  static receiveOpponentReady(payload) {
+    const name = payload?.name;
+    if (name) ui.notifications.info(`${name} is ready.`);
+    return true;
   }
+
+  /* -------------------- Resolution ------------- */
 
   static async resolveAndAnnounce({ challenger, target }) {
     const chalActor = game.actors.get(challenger.token.actorId);
     const targActor = game.actors.get(target.token.actorId);
-    const cOutcome = rpsOutcome(challenger.stance, target.stance);
-    let rpsBanner;
-    if (cOutcome === 0) rpsBanner = `Tie — both chose ${STANCES[challenger.stance]?.label ?? challenger.stance}`;
-    else if (cOutcome === 1) rpsBanner = `${STANCES[challenger.stance].label} beats ${STANCES[target.stance].label} → ${challenger.token.name} wins the duel`;
-    else rpsBanner = `${STANCES[target.stance].label} beats ${STANCES[challenger.stance].label} → ${target.token.name} wins the duel`;
 
-    // Rolls: d20 + modifier (v13: evaluate without async option)
-    const cRoll = await new Roll(`1d20 + ${Number(challenger.modifier) || 0}`, {}).evaluate();
-    const tRoll = await new Roll(`1d20 + ${Number(target.modifier) || 0}`, {}).evaluate();
+    const cRoll = await new Roll(`1d20 + ${Number(challenger.modifier) || 0}`).evaluate();
+    const tRoll = await new Roll(`1d20 + ${Number(target.modifier) || 0}`).evaluate();
 
-    // Post separate messages: challenger roll, target roll, outcome
-    const chalFlavor = `Magic Duel — Challenger: ${challenger.token.name} — ${STANCES[challenger.stance].label} — ${challenger.skillLabel}${challenger.anteLevel ? ` — Ante: L${challenger.anteLevel}` : ""}`;
-    const targFlavor = `Magic Duel — Target: ${target.token.name} — ${STANCES[target.stance].label} — ${target.skillLabel}${target.anteLevel ? ` — Ante: L${target.anteLevel}` : ""}`;
+    const chalFlavor = `Magic Duel — Challenger: ${challenger.token.name} — ${stanceLabel(
+      challenger.stance,
+    )} — ${challenger.skillLabel}${challenger.anteLevel ? ` — Ante: L${challenger.anteLevel}` : ""}`;
+    const targFlavor = `Magic Duel — Target: ${target.token.name} — ${stanceLabel(
+      target.stance,
+    )} — ${target.skillLabel}${target.anteLevel ? ` — Ante: L${target.anteLevel}` : ""}`;
 
-    await cRoll.toMessage({ speaker: ChatMessage.getSpeaker({ actor: chalActor }), flavor: chalFlavor });
-    await tRoll.toMessage({ speaker: ChatMessage.getSpeaker({ actor: targActor }), flavor: targFlavor });
+    await cRoll.toMessage({
+      speaker: ChatMessage.getSpeaker({ actor: chalActor }),
+      flavor: chalFlavor,
+    });
+    await tRoll.toMessage({
+      speaker: ChatMessage.getSpeaker({ actor: targActor }),
+      flavor: targFlavor,
+    });
 
-    // Tie-breaker: stance first, then ante (higher level), then roll total
-    let outcomeBy = "stance";
-    let finalOutcome = cOutcome;
-    if (finalOutcome === 0) {
-      const ca = Number(challenger.anteLevel || 0);
-      const ta = Number(target.anteLevel || 0);
-      if (ca !== ta) { finalOutcome = ca > ta ? 1 : -1; outcomeBy = "ante"; }
-      else if ((cRoll.total ?? 0) !== (tRoll.total ?? 0)) { finalOutcome = (cRoll.total ?? 0) > (tRoll.total ?? 0) ? 1 : -1; outcomeBy = "roll"; }
-    }
+    const outcome = resolveDuel({
+      challengerStance: challenger.stance,
+      targetStance: target.stance,
+      challengerAnte: challenger.anteLevel,
+      targetAnte: target.anteLevel,
+      challengerRoll: cRoll.total,
+      targetRoll: tRoll.total,
+    });
 
-    let banner;
-    if (finalOutcome === 0) banner = `Tie — both chose ${STANCES[challenger.stance]?.label ?? challenger.stance}, equal ante, and equal roll`;
-    else if (finalOutcome === 1) {
-      if (outcomeBy === "stance") banner = `${STANCES[challenger.stance].label} beats ${STANCES[target.stance].label} → ${challenger.token.name} wins the duel`;
-      else if (outcomeBy === "ante") banner = `Tie on stance. Higher ante (L${challenger.anteLevel || 0} vs L${target.anteLevel || 0}) → ${challenger.token.name} wins the duel`;
-      else banner = `Tie on stance and ante. Higher roll (${cRoll.total} vs ${tRoll.total}) → ${challenger.token.name} wins the duel`;
-    } else {
-      if (outcomeBy === "stance") banner = `${STANCES[target.stance].label} beats ${STANCES[challenger.stance].label} → ${target.token.name} wins the duel`;
-      else if (outcomeBy === "ante") banner = `Tie on stance. Higher ante (L${target.anteLevel || 0} vs L${challenger.anteLevel || 0}) → ${target.token.name} wins the duel`;
-      else banner = `Tie on stance and ante. Higher roll (${tRoll.total} vs ${cRoll.total}) → ${target.token.name} wins the duel`;
-    }
+    const banner = DuelManager._buildBanner(outcome, challenger, target, cRoll, tRoll);
 
-    const outcomeContent = `<div class="md-chat">
+    const outcomeContent = `<div class="magic-dueling-chat">
       <h3>Magic Duel — Outcome</h3>
-      <div class="md-outcome"><strong>${banner}</strong></div>
+      <div class="magic-dueling-outcome"><strong>${banner}</strong></div>
     </div>`;
 
-    await ChatMessage.create({ content: outcomeContent, speaker: ChatMessage.getSpeaker({ actor: chalActor || targActor }) });
+    await ChatMessage.create({
+      content: outcomeContent,
+      speaker: ChatMessage.getSpeaker({ actor: chalActor || targActor }),
+    });
+  }
+
+  static _buildBanner(outcome, challenger, target, cRoll, tRoll) {
+    const cName = challenger.token.name;
+    const tName = target.token.name;
+    const cStance = stanceLabel(challenger.stance);
+    const tStance = stanceLabel(target.stance);
+
+    if (outcome.winner === "tie") {
+      return `Tie — both chose ${cStance}, equal ante, and equal roll`;
+    }
+
+    const winnerIsChallenger = outcome.winner === "challenger";
+    const winName = winnerIsChallenger ? cName : tName;
+    const winStance = winnerIsChallenger ? cStance : tStance;
+    const loseStance = winnerIsChallenger ? tStance : cStance;
+    const winAnte = winnerIsChallenger ? outcome.challengerAnte : outcome.targetAnte;
+    const loseAnte = winnerIsChallenger ? outcome.targetAnte : outcome.challengerAnte;
+    const winRoll = winnerIsChallenger ? cRoll.total : tRoll.total;
+    const loseRoll = winnerIsChallenger ? tRoll.total : cRoll.total;
+
+    if (outcome.by === "stance") {
+      return `${winStance} beats ${loseStance} → ${winName} wins the duel`;
+    }
+    if (outcome.by === "ante") {
+      return `Tie on stance. Higher ante (L${winAnte} vs L${loseAnte}) → ${winName} wins the duel`;
+    }
+    return `Tie on stance and ante. Higher roll (${winRoll} vs ${loseRoll}) → ${winName} wins the duel`;
   }
 }
 
@@ -522,16 +754,11 @@ Hooks.once("ready", () => {
   DuelManager.init();
 });
 
-// Expose API as early as possible for macros executed before "ready"
+// Expose the API early so macros running before "ready" still work.
 Hooks.once("init", () => {
   try {
-    const mod = game.modules.get(MODULE_ID);
-    if (mod) mod.api = { initiate: DuelManager.initiateFromSelection };
-    // Optional global for convenience
-    globalThis.MagicDueling = { initiate: DuelManager.initiateFromSelection };
+    DuelManager.exposeApi();
   } catch (e) {
     console.error(MODULE_ID, "Failed to expose early API", e);
   }
 });
-
-
